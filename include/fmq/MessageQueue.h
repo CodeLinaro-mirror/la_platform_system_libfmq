@@ -31,7 +31,7 @@ namespace hardware {
 
 template <typename T, MQFlavor flavor>
 struct MessageQueue {
-    typedef MQDescriptor<T,flavor> Descriptor;
+    typedef MQDescriptor<T, flavor> Descriptor;
 
     /**
      * @param Desc MQDescriptor describing the FMQ.
@@ -149,10 +149,11 @@ struct MessageQueue {
      *
      * @return Whether the write was successful.
      */
-
     bool writeBlocking(const T* data, size_t count, uint32_t readNotification,
                        uint32_t writeNotification, int64_t timeOutNanos = 0,
                        android::hardware::EventFlag* evFlag = nullptr);
+
+    bool writeBlocking(const T* data, size_t count, int64_t timeOutNanos = 0);
 
     /**
      * Read some data from the FMQ without blocking.
@@ -200,6 +201,8 @@ struct MessageQueue {
                       uint32_t writeNotification, int64_t timeOutNanos = 0,
                       android::hardware::EventFlag* evFlag = nullptr);
 
+    bool readBlocking(T* data, size_t count, int64_t timeOutNanos = 0);
+
     /**
      * Get a pointer to the MQDescriptor object that describes this FMQ.
      *
@@ -243,6 +246,11 @@ private:
     void* mapGrantorDescr(uint32_t grantorIdx);
     void unmapGrantorDescr(void* address, uint32_t grantorIdx);
     void initMemory(bool resetPointers);
+
+    enum DefaultEventNotification : uint32_t {
+        FMQ_NOT_FULL  = 0x01,
+        FMQ_NOT_EMPTY = 0x02
+    };
 
     std::unique_ptr<Descriptor> mDesc;
     uint8_t* mRing = nullptr;
@@ -332,11 +340,13 @@ MessageQueue<T, flavor>::MessageQueue(size_t numElementsInQueue, bool configureE
     }
 
     /*
-     * Ashmem memory region size needs to
-     * be specified in page-aligned bytes.
+     * Ashmem memory region size needs to be specified in page-aligned bytes.
+     * kQueueSizeBytes needs to be aligned to word boundary so that all offsets
+     * in the grantorDescriptor will be word aligned.
      */
     size_t kAshmemSizePageAligned =
-            (kQueueSizeBytes + kMetaDataSize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            (Descriptor::alignToWordBoundary(kQueueSizeBytes) + kMetaDataSize + PAGE_SIZE - 1) &
+            ~(PAGE_SIZE - 1);
 
     /*
      * Create an ashmem region to map the memory for the ringbuffer,
@@ -463,7 +473,7 @@ bool MessageQueue<T, flavor>::writeBlocking(const T* data,
          * notification.
          */
         status_t status = evFlag->wait(readNotification, &efState, timeOutNanos);
-        switch(status) {
+        switch (status) {
             case android::NO_ERROR:
                 /*
                  * If wait() returns NO_ERROR, break and check efState.
@@ -507,6 +517,13 @@ bool MessageQueue<T, flavor>::writeBlocking(const T* data,
     }
 
     return result;
+}
+
+template <typename T, MQFlavor flavor>
+bool MessageQueue<T, flavor>::writeBlocking(const T* data,
+                   size_t count,
+                   int64_t timeOutNanos) {
+    return writeBlocking(data, count, FMQ_NOT_FULL, FMQ_NOT_EMPTY, timeOutNanos);
 }
 
 template <typename T, MQFlavor flavor>
@@ -561,7 +578,7 @@ bool MessageQueue<T, flavor>::readBlocking(T* data,
          * notification.
          */
         status_t status = evFlag->wait(writeNotification, &efState, timeOutNanos);
-        switch(status) {
+        switch (status) {
             case android::NO_ERROR:
                 /*
                  * If wait() returns NO_ERROR, break and check efState.
@@ -605,6 +622,11 @@ bool MessageQueue<T, flavor>::readBlocking(T* data,
     }
 
     return result;
+}
+
+template <typename T, MQFlavor flavor>
+bool MessageQueue<T, flavor>::readBlocking(T* data, size_t count, int64_t timeOutNanos) {
+    return readBlocking(data, count, FMQ_NOT_FULL, FMQ_NOT_EMPTY, timeOutNanos);
 }
 
 template <typename T, MQFlavor flavor>
