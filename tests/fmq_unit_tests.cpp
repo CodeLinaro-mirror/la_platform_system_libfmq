@@ -24,6 +24,8 @@
 #include <sstream>
 #include <thread>
 
+using aidl::android::hardware::common::fmq::SynchronizedReadWrite;
+using aidl::android::hardware::common::fmq::UnsynchronizedWrite;
 using android::hardware::kSynchronizedReadWrite;
 using android::hardware::kUnsynchronizedWrite;
 
@@ -32,11 +34,11 @@ enum EventFlagBits : uint32_t {
     kFmqNotFull = 1 << 1,
 };
 
-typedef android::AidlMessageQueue<uint8_t, kSynchronizedReadWrite> AidlMessageQueueSync;
-typedef android::AidlMessageQueue<uint8_t, kUnsynchronizedWrite> AidlMessageQueueUnsync;
+typedef android::AidlMessageQueue<uint8_t, SynchronizedReadWrite> AidlMessageQueueSync;
+typedef android::AidlMessageQueue<uint8_t, UnsynchronizedWrite> AidlMessageQueueUnsync;
 typedef android::hardware::MessageQueue<uint8_t, kSynchronizedReadWrite> MessageQueueSync;
 typedef android::hardware::MessageQueue<uint8_t, kUnsynchronizedWrite> MessageQueueUnsync;
-typedef android::AidlMessageQueue<uint16_t, kSynchronizedReadWrite> AidlMessageQueueSync16;
+typedef android::AidlMessageQueue<uint16_t, SynchronizedReadWrite> AidlMessageQueueSync16;
 typedef android::hardware::MessageQueue<uint16_t, kSynchronizedReadWrite> MessageQueueSync16;
 
 // Run everything on both the AIDL and HIDL versions with sync and unsync flavors
@@ -73,10 +75,10 @@ class SynchronizedReadWrites : public TestBase<T> {
     size_t mNumMessagesMax = 0;
 };
 
-TYPED_TEST_CASE(UnsynchronizedWrite, UnsyncTypes);
+TYPED_TEST_CASE(UnsynchronizedWriteTest, UnsyncTypes);
 
 template <typename T>
-class UnsynchronizedWrite : public TestBase<T> {
+class UnsynchronizedWriteTest : public TestBase<T> {
   protected:
     virtual void TearDown() {
         delete mQueue;
@@ -243,7 +245,7 @@ TEST_F(AidlOnlyBadQueueConfig, QueueSizeTooLargeForAidl) {
 }
 
 TEST_F(AidlOnlyBadQueueConfig, NegativeAidlDescriptor) {
-    aidl::android::hardware::common::MQDescriptor desc;
+    aidl::android::hardware::common::fmq::MQDescriptor<uint16_t, SynchronizedReadWrite> desc;
     desc.quantum = -10;
     AidlMessageQueueSync16* fmq = new (std::nothrow) AidlMessageQueueSync16(desc);
     ASSERT_NE(nullptr, fmq);
@@ -254,11 +256,11 @@ TEST_F(AidlOnlyBadQueueConfig, NegativeAidlDescriptor) {
 }
 
 TEST_F(AidlOnlyBadQueueConfig, NegativeAidlDescriptorGrantor) {
-    aidl::android::hardware::common::MQDescriptor desc;
+    aidl::android::hardware::common::fmq::MQDescriptor<uint16_t, SynchronizedReadWrite> desc;
     desc.quantum = 2;
     desc.flags = 0;
     desc.grantors.push_back(
-            aidl::android::hardware::common::GrantorDescriptor{.offset = 12, .extent = -10});
+            aidl::android::hardware::common::fmq::GrantorDescriptor{.offset = 12, .extent = -10});
     AidlMessageQueueSync16* fmq = new (std::nothrow) AidlMessageQueueSync16(desc);
     ASSERT_NE(nullptr, fmq);
     /*
@@ -266,6 +268,28 @@ TEST_F(AidlOnlyBadQueueConfig, NegativeAidlDescriptorGrantor) {
      */
     ASSERT_FALSE(fmq->isValid());
 }
+
+/*
+ * Test creating a new queue from a modified MQDescriptor of another queue.
+ * If MQDescriptor.quantum doesn't match the size of the payload(T), the queue
+ * should be invalid.
+ */
+TEST_F(AidlOnlyBadQueueConfig, MismatchedPayloadSize) {
+    AidlMessageQueueSync16 fmq = AidlMessageQueueSync16(64);
+    aidl::android::hardware::common::fmq::MQDescriptor<uint16_t, SynchronizedReadWrite> desc =
+            fmq.dupeDesc();
+    // This should work fine with the unmodified MQDescriptor
+    AidlMessageQueueSync16 fmq2 = AidlMessageQueueSync16(desc);
+    ASSERT_TRUE(fmq2.isValid());
+
+    // Simulate a difference in payload size between processes handling the queue
+    desc.quantum = 8;
+    AidlMessageQueueSync16 fmq3 = AidlMessageQueueSync16(desc);
+
+    // Should fail due to the quantum not matching the sizeof(uint16_t)
+    ASSERT_FALSE(fmq3.isValid());
+}
+
 /*
  * Test that basic blocking works. This test uses the non-blocking read()/write()
  * APIs.
@@ -700,7 +724,7 @@ TYPED_TEST(SynchronizedReadWrites, ReadWriteWrapAround2) {
 /*
  * Verify that a few bytes of data can be successfully written and read.
  */
-TYPED_TEST(UnsynchronizedWrite, SmallInputTest1) {
+TYPED_TEST(UnsynchronizedWriteTest, SmallInputTest1) {
     const size_t dataLen = 16;
     ASSERT_LE(dataLen, this->mNumMessagesMax);
     uint8_t data[dataLen];
@@ -715,7 +739,7 @@ TYPED_TEST(UnsynchronizedWrite, SmallInputTest1) {
 /*
  * Verify that read() returns false when trying to read from an empty queue.
  */
-TYPED_TEST(UnsynchronizedWrite, ReadWhenEmpty) {
+TYPED_TEST(UnsynchronizedWriteTest, ReadWhenEmpty) {
     ASSERT_EQ(0UL, this->mQueue->availableToRead());
     const size_t dataLen = 2;
     ASSERT_TRUE(dataLen < this->mNumMessagesMax);
@@ -727,7 +751,7 @@ TYPED_TEST(UnsynchronizedWrite, ReadWhenEmpty) {
  * Write the queue when full. Verify that a subsequent writes is succesful.
  * Verify that availableToWrite() returns 0 as expected.
  */
-TYPED_TEST(UnsynchronizedWrite, WriteWhenFull1) {
+TYPED_TEST(UnsynchronizedWriteTest, WriteWhenFull1) {
     ASSERT_EQ(0UL, this->mQueue->availableToRead());
     std::vector<uint8_t> data(this->mNumMessagesMax);
 
@@ -745,7 +769,7 @@ TYPED_TEST(UnsynchronizedWrite, WriteWhenFull1) {
  * using beginRead()/commitRead() is succesful.
  * Verify that the next read fails as expected for unsynchronized flavor.
  */
-TYPED_TEST(UnsynchronizedWrite, WriteWhenFull2) {
+TYPED_TEST(UnsynchronizedWriteTest, WriteWhenFull2) {
     ASSERT_EQ(0UL, this->mQueue->availableToRead());
     std::vector<uint8_t> data(this->mNumMessagesMax);
     ASSERT_TRUE(this->mQueue->write(&data[0], this->mNumMessagesMax));
@@ -768,7 +792,7 @@ TYPED_TEST(UnsynchronizedWrite, WriteWhenFull2) {
  * Verify that the write is successful and the subsequent read
  * returns the expected data.
  */
-TYPED_TEST(UnsynchronizedWrite, LargeInputTest1) {
+TYPED_TEST(UnsynchronizedWriteTest, LargeInputTest1) {
     std::vector<uint8_t> data(this->mNumMessagesMax);
     initData(&data[0], this->mNumMessagesMax);
     ASSERT_TRUE(this->mQueue->write(&data[0], this->mNumMessagesMax));
@@ -782,7 +806,7 @@ TYPED_TEST(UnsynchronizedWrite, LargeInputTest1) {
  * Verify that it fails. Verify that a subsequent read fails and
  * the queue is still empty.
  */
-TYPED_TEST(UnsynchronizedWrite, LargeInputTest2) {
+TYPED_TEST(UnsynchronizedWriteTest, LargeInputTest2) {
     ASSERT_EQ(0UL, this->mQueue->availableToRead());
     const size_t dataLen = 4096;
     ASSERT_GT(dataLen, this->mNumMessagesMax);
@@ -800,7 +824,7 @@ TYPED_TEST(UnsynchronizedWrite, LargeInputTest2) {
  * the attempt is succesful. Verify that the read fails
  * as expected.
  */
-TYPED_TEST(UnsynchronizedWrite, LargeInputTest3) {
+TYPED_TEST(UnsynchronizedWriteTest, LargeInputTest3) {
     std::vector<uint8_t> data(this->mNumMessagesMax);
     initData(&data[0], this->mNumMessagesMax);
     ASSERT_TRUE(this->mQueue->write(&data[0], this->mNumMessagesMax));
@@ -812,7 +836,7 @@ TYPED_TEST(UnsynchronizedWrite, LargeInputTest3) {
 /*
  * Verify that multiple reads one after the other return expected data.
  */
-TYPED_TEST(UnsynchronizedWrite, MultipleRead) {
+TYPED_TEST(UnsynchronizedWriteTest, MultipleRead) {
     const size_t chunkSize = 100;
     const size_t chunkNum = 5;
     const size_t dataLen = chunkSize * chunkNum;
@@ -830,7 +854,7 @@ TYPED_TEST(UnsynchronizedWrite, MultipleRead) {
 /*
  * Verify that multiple writes one after the other happens correctly.
  */
-TYPED_TEST(UnsynchronizedWrite, MultipleWrite) {
+TYPED_TEST(UnsynchronizedWriteTest, MultipleWrite) {
     const size_t chunkSize = 100;
     const size_t chunkNum = 5;
     const size_t dataLen = chunkSize * chunkNum;
@@ -853,7 +877,7 @@ TYPED_TEST(UnsynchronizedWrite, MultipleWrite) {
  * Write mNumMessagesMax messages into the queue. This will cause a
  * wrap around. Read and verify the data.
  */
-TYPED_TEST(UnsynchronizedWrite, ReadWriteWrapAround) {
+TYPED_TEST(UnsynchronizedWriteTest, ReadWriteWrapAround) {
     size_t numMessages = this->mNumMessagesMax - 1;
     std::vector<uint8_t> data(this->mNumMessagesMax);
     std::vector<uint8_t> readData(this->mNumMessagesMax);
