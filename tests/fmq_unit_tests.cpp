@@ -27,7 +27,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <sstream>
+#include <string>
 #include <thread>
 
 using aidl::android::hardware::common::fmq::SynchronizedReadWrite;
@@ -702,6 +704,89 @@ TEST_F(DoubleFdFailures, LargerFdSize) {
     EXPECT_TRUE(fmq.isValid());
 }
 
+class PointerCorruptionTest : public ::testing::Test {
+  public:
+    typename android::MessageQueueBase<android::hardware::MQDescriptor, uint16_t,
+                                       kSynchronizedReadWrite>::Error mErrorType;
+    std::string mErrorMessage;
+
+    void SetUp() override {
+        mErrorMessage = "";
+        mErrorType = android::MessageQueueBase<android::hardware::MQDescriptor, uint16_t,
+                                               kSynchronizedReadWrite>::Error::NONE;
+    }
+
+    void errorHandler(typename android::MessageQueueBase<android::hardware::MQDescriptor, uint16_t,
+                                                         kSynchronizedReadWrite>::Error errorType,
+                      std::string errorMessage) {
+        mErrorType = errorType;
+        mErrorMessage = errorMessage;
+    }
+};
+
+TEST_F(PointerCorruptionTest, NoMisalignedReadPointer) {
+    size_t numElementsInQueue = 64;
+    size_t payloadSizeBytes = sizeof(uint16_t);
+
+    // Create the MessageQueue
+    android::hardware::MessageQueue<uint16_t, kSynchronizedReadWrite> fmq(numElementsInQueue);
+    ASSERT_TRUE(fmq.isValid());
+
+    // Set the custom error handler
+    fmq.setErrorHandler(std::bind(&PointerCorruptionTest::errorHandler, this, std::placeholders::_1,
+                                  std::placeholders::_2));
+
+    // Attempt to read (should fail because queue is empty, but not trigger error handler)
+    uint16_t data;
+    ASSERT_FALSE(fmq.read(&data, 1));
+
+    // Verify the error handler was NOT called
+    ASSERT_EQ(mErrorType, (android::MessageQueueBase<android::hardware::MQDescriptor, uint16_t,
+                                                     kSynchronizedReadWrite>::Error::NONE));
+    ASSERT_EQ(mErrorMessage, "");
+}
+
+TEST_F(PointerCorruptionTest, MisalignedReadPointerViaTypePunning) {
+    size_t numElementsInQueue = 64;
+    // Create a byte queue (uint8_t)
+    android::hardware::MessageQueue<uint8_t, kSynchronizedReadWrite> fmqByte(numElementsInQueue *
+                                                                             sizeof(uint16_t));
+    ASSERT_TRUE(fmqByte.isValid());
+
+    // Write 1 byte to misalign the pointer for uint16_t (quantum 2)
+    uint8_t data = 0xAA;
+    ASSERT_TRUE(fmqByte.write(&data, 1));
+
+    // Get the descriptor from fmqByte
+    const auto* byteDesc = fmqByte.getDesc();
+    ASSERT_NE(nullptr, byteDesc);
+
+    // Create a new descriptor for uint16_t with the same handle but quantum 2
+    native_handle_t* handle = native_handle_clone(byteDesc->handle());
+    android::hardware::MQDescriptor<uint16_t, kSynchronizedReadWrite> shortDesc(
+            byteDesc->grantors(), handle, sizeof(uint16_t));
+
+    // Create the short queue (uint16_t) sharing the memory, without resetting pointers
+    android::hardware::MessageQueue<uint16_t, kSynchronizedReadWrite> fmqShort(
+            shortDesc, false /* resetPointers */);
+    ASSERT_TRUE(fmqShort.isValid());
+
+    // Set the custom error handler
+    fmqShort.setErrorHandler(std::bind(&PointerCorruptionTest::errorHandler, this,
+                                       std::placeholders::_1, std::placeholders::_2));
+
+    // Attempt to read to trigger the error handler
+    uint16_t readData;
+    fmqShort.read(&readData, 1);
+
+    // Verify the error handler was called with the correct error type and message
+    ASSERT_EQ(mErrorType,
+              (android::MessageQueueBase<android::hardware::MQDescriptor, uint16_t,
+                                         kSynchronizedReadWrite>::Error::POINTER_CORRUPTION));
+    ASSERT_NE(mErrorMessage.find("The write or read pointer has become misaligned."),
+              std::string::npos);
+}
+
 /*
  * Test that basic blocking works. This test uses the non-blocking read()/write()
  * APIs.
@@ -1205,6 +1290,63 @@ TYPED_TEST(SynchronizedReadWrites, ReadWriteWrapAround2) {
     ASSERT_EQ(data, readData);
 }
 
+TYPED_TEST(SynchronizedReadWrites, ReadLatestEmpty) {
+    uint8_t data;
+    ASSERT_EQ(0, this->mQueue->readLatest(&data));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(SynchronizedReadWrites, ReadLatestSingle) {
+    uint8_t wData = 123;
+    ASSERT_TRUE(this->mQueue->write(&wData));
+
+    uint8_t rData = 0;
+    ASSERT_EQ(1, this->mQueue->readLatest(&rData));
+    ASSERT_EQ(wData, rData);
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(SynchronizedReadWrites, ReadLatestMultiple) {
+    const size_t numMessages = 10;
+    uint8_t wData[numMessages];
+    initData(wData, numMessages);
+
+    ASSERT_TRUE(this->mQueue->write(wData, numMessages));
+
+    uint8_t rData = 0;
+    ASSERT_EQ(1, this->mQueue->readLatest(&rData));
+    ASSERT_EQ(wData[numMessages - 1], rData);
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(SynchronizedReadWrites, ReadLatestMultipleCount) {
+    const size_t numMessages = 20;
+    uint8_t wData[numMessages];
+    initData(wData, numMessages);
+
+    ASSERT_TRUE(this->mQueue->write(wData, numMessages));
+
+    const size_t readCount = 5;
+    uint8_t rData[readCount];
+    ASSERT_EQ(readCount, this->mQueue->readLatest(rData, readCount));
+    ASSERT_EQ(0, memcmp(rData, &wData[numMessages - readCount], readCount));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(SynchronizedReadWrites, ReadLatestMoreThanAvailable) {
+    const size_t numMessages = 10;
+    uint8_t wData[numMessages];
+    initData(wData, numMessages);
+
+    ASSERT_TRUE(this->mQueue->write(wData, numMessages));
+
+    const size_t readCount = 15;
+    uint8_t rData[readCount];
+    ASSERT_EQ(numMessages, this->mQueue->readLatest(rData, readCount));
+    ASSERT_EQ(0, memcmp(rData, wData, numMessages));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
 /*
  * Verify that a few bytes of data can be successfully written and read.
  */
@@ -1374,6 +1516,81 @@ TYPED_TEST(UnsynchronizedReadWriteTest, ReadWriteWrapAround) {
     ASSERT_EQ(data, readData);
 }
 
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestEmpty) {
+    uint8_t data;
+    ASSERT_EQ(0, this->mQueue->readLatest(&data));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestSingle) {
+    uint8_t wData = 123;
+    ASSERT_TRUE(this->mQueue->write(&wData));
+
+    uint8_t rData = 0;
+    ASSERT_EQ(1, this->mQueue->readLatest(&rData));
+    ASSERT_EQ(wData, rData);
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestMultiple) {
+    const size_t numMessages = 10;
+    uint8_t wData[numMessages];
+    initData(wData, numMessages);
+
+    ASSERT_TRUE(this->mQueue->write(wData, numMessages));
+
+    uint8_t rData = 0;
+    ASSERT_EQ(1, this->mQueue->readLatest(&rData));
+    ASSERT_EQ(wData[numMessages - 1], rData);
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestMultipleCount) {
+    const size_t numMessages = 20;
+    uint8_t wData[numMessages];
+    initData(wData, numMessages);
+
+    ASSERT_TRUE(this->mQueue->write(wData, numMessages));
+
+    const size_t readCount = 5;
+    uint8_t rData[readCount];
+    ASSERT_EQ(readCount, this->mQueue->readLatest(rData, readCount));
+    ASSERT_EQ(0, memcmp(rData, &wData[numMessages - readCount], readCount));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestMoreThanAvailable) {
+    const size_t numMessages = 10;
+    uint8_t wData[numMessages];
+    initData(wData, numMessages);
+
+    ASSERT_TRUE(this->mQueue->write(wData, numMessages));
+
+    const size_t readCount = 15;
+    uint8_t rData[readCount];
+    ASSERT_EQ(numMessages, this->mQueue->readLatest(rData, readCount));
+    ASSERT_EQ(0, memcmp(rData, wData, numMessages));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestAfterOverflow) {
+    // Fill the queue and cause an overflow
+    std::vector<uint8_t> data(this->mNumMessagesMax);
+    initData(data.data(), data.size());
+    ASSERT_TRUE(this->mQueue->write(data.data(), data.size()));
+    ASSERT_TRUE(this->mQueue->write(data.data(), 1));
+
+    // After an overflow, a normal read would fail.
+    uint8_t temp;
+    ASSERT_FALSE(this->mQueue->read(&temp, 1));
+
+    // readLatest should still work and recover the queue state.
+    uint8_t rData;
+    ASSERT_EQ(1, this->mQueue->readLatest(&rData));
+    ASSERT_EQ(data[0], rData);
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
 /*
  * Attempt to read more than the maximum number of messages in the queue.
  */
@@ -1401,6 +1618,42 @@ TYPED_TEST(UnsynchronizedReadWriteTest, ReadMoreThanAvailableToReadFails) {
     // Attempt to read more than the available data.
     std::vector<uint8_t> readData(dataLen + 1);
     ASSERT_FALSE(this->mQueue->read(readData.data(), readData.size()));
+}
+
+/*
+ * Verify that readLatest() reads all available messages when asked for more
+ * than the queue capacity.
+ */
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestMoreThanNumMessagesMax) {
+    // Fill the queue with data
+    std::vector<uint8_t> data(this->mNumMessagesMax);
+    initData(data.data(), data.size());
+    ASSERT_TRUE(this->mQueue->write(data.data(), data.size()));
+
+    // Attempt to read more than the maximum number of messages in the queue.
+    std::vector<uint8_t> readData(this->mNumMessagesMax + 1);
+    ASSERT_EQ(this->mNumMessagesMax,
+              this->mQueue->readLatest(readData.data(), readData.size()));
+    ASSERT_EQ(0, memcmp(data.data(), readData.data(), this->mNumMessagesMax));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
+}
+
+/*
+ * Verify that readLatest() reads all available messages when asked for more
+ * than is available.
+ */
+TYPED_TEST(UnsynchronizedReadWriteTest, ReadLatestMoreThanAvailableToRead) {
+    // Fill half of the queue with data.
+    size_t dataLen = this->mNumMessagesMax / 2;
+    std::vector<uint8_t> data(dataLen);
+    initData(data.data(), data.size());
+    ASSERT_TRUE(this->mQueue->write(data.data(), data.size()));
+
+    // Attempt to read more than the available data.
+    std::vector<uint8_t> readData(dataLen + 1);
+    ASSERT_EQ(dataLen, this->mQueue->readLatest(readData.data(), readData.size()));
+    ASSERT_EQ(0, memcmp(data.data(), readData.data(), dataLen));
+    ASSERT_EQ(0, this->mQueue->availableToRead());
 }
 
 /*
