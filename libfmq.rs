@@ -20,35 +20,23 @@ use fmq_bindgen::{
     convertDesc, convertGrantor, descFlags, descGrantors, descHandleFDs, descHandleInts,
     descHandleNumFDs, descHandleNumInts, descNumGrantors, descQuantum, freeDesc,
     ndk_ScopedFileDescriptor, ErasedMessageQueue, ErasedMessageQueueDesc, GrantorDescriptor,
-    MQDescriptor, MemTransaction, NativeHandle, ParcelFileDescriptor, SynchronizedReadWrite,
+    MemTransaction, NativeHandle, ParcelFileDescriptor,
 };
 use log::error;
-use zerocopy::{FromBytes, Immutable, IntoBytes};
+use zerocopy::TryFromBytes;
 
-use std::ptr::addr_of_mut;
+use std::marker::PhantomData;
+use std::mem::MaybeUninit;
+use std::ptr::{self, addr_of_mut, NonNull};
+use std::sync::atomic::AtomicU32;
+use std::time::Duration;
 
-/// A trait indicating that a type is safe to pass through shared memory.
-///
-/// # Safety
-///
-/// This requires that the type must not contain any capabilities such as file
-/// descriptors or heap allocations, and that it must be permitted to access
-/// all bytes of its representation (so it must not contain any padding bytes).
-///
-/// Because being stored in shared memory the allows the type to be accessed
-/// from different processes, it may also be accessed from different threads in
-/// the same process. As such, `Share` is a supertrait of `Sync`.
-pub unsafe trait Share: Sync {}
-
-// SAFETY: All types implementing the zerocopy `Immutable`, `IntoBytes` and `FromBytes` traits
-// implement `Share`, because that implies that they don't have any interior mutability and can be
-// treated as just a slice of bytes.
-unsafe impl<T: Immutable + IntoBytes + FromBytes + Send + Sync> Share for T {}
+pub use fmq_bindgen::{MQDescriptor, SynchronizedReadWrite};
 
 /// An IPC message queue for values of type T.
 pub struct MessageQueue<T> {
     inner: ErasedMessageQueue,
-    ty: core::marker::PhantomData<T>,
+    ty: PhantomData<T>,
 }
 
 /** A write completion from the MessageQueue::write() method.
@@ -58,14 +46,14 @@ these must be forbidden because the underlying AidlMessageQueue only stores the
 number of outstanding writes, not which have and have not completed, so they
 must complete in order. */
 #[must_use]
-pub struct WriteCompletion<'a, T: Share> {
+pub struct WriteCompletion<'a, T: binder::WriteTo> {
     inner: MemTransaction,
     queue: &'a mut MessageQueue<T>,
     n_elems: usize,
     n_written: usize,
 }
 
-impl<T: Share> WriteCompletion<'_, T> {
+impl<T: binder::WriteTo> WriteCompletion<'_, T> {
     /// Obtain a pointer to the location at which the idx'th item should be
     /// stored.
     ///
@@ -119,7 +107,7 @@ impl<T: Share> WriteCompletion<'_, T> {
             //
             // The dtor of data, if any, will not run because `data` is moved
             // out of here.
-            unsafe { self.ptr(self.n_written).write_volatile(data) };
+            unsafe { data.write_to_volatile(self.ptr(self.n_written)) };
             self.n_written += 1;
             Ok(())
         } else {
@@ -142,7 +130,7 @@ impl<T: Share> WriteCompletion<'_, T> {
     }
 }
 
-impl<T: Share> Drop for WriteCompletion<'_, T> {
+impl<T: binder::WriteTo> Drop for WriteCompletion<'_, T> {
     fn drop(&mut self) {
         if self.n_written < self.n_elems {
             error!(
@@ -155,19 +143,22 @@ impl<T: Share> Drop for WriteCompletion<'_, T> {
     }
 }
 
-impl<T: Share> MessageQueue<T> {
+impl<T> MessageQueue<T> {
     const fn type_size() -> usize {
         std::mem::size_of::<T>()
     }
 
     /// Create a new MessageQueue with capacity for `elems` elements.
+    ///
+    /// If `event_word` is true, allocate an EventFlag word to use for
+    /// synchronization on the status of the queue.
     pub fn new(elems: usize, event_word: bool) -> Self {
         Self {
             // SAFETY: Calling bindgen'd constructor. The only argument that
             // can't be validated by the implementation is the quantum, which
             // must equal the element size.
             inner: unsafe { ErasedMessageQueue::new1(elems, event_word, Self::type_size()) },
-            ty: core::marker::PhantomData,
+            ty: PhantomData,
         }
     }
 
@@ -204,7 +195,7 @@ impl<T: Share> MessageQueue<T> {
         // SAFETY: we must free the desc returned by convertDesc; the pointer
         // was just returned above so we know it is valid.
         unsafe { freeDesc(cpp_desc) };
-        Self { inner, ty: core::marker::PhantomData }
+        Self { inner, ty: PhantomData }
     }
 
     /// Obtain a copy of the MessageQueue's descriptor, which may be used to
@@ -276,7 +267,29 @@ impl<T: Share> MessageQueue<T> {
         unsafe { freeDesc(erased_desc) };
         desc
     }
+}
 
+/// Waiting for a zero duration is interpreted as waiting forever by the C++
+/// readBlocking/writeBlocking calls. In Rust this kind of sentinel behavior is
+/// a smell as the Option type is idiomatic, so bump 0ns timeouts to 1ns.
+fn timeout_nanos(timeout: Option<Duration>) -> i64 {
+    let nanos = timeout.map(|t| t.as_nanos().max(1)).unwrap_or(0);
+    // Saturate to maximum i64 if nanos exceeds its range
+    nanos.try_into().unwrap_or(i64::MAX)
+}
+
+#[test]
+fn test_timeout_nanos() {
+    assert_eq!(timeout_nanos(None), 0);
+    assert_eq!(timeout_nanos(Some(Duration::from_nanos(0))), 1);
+    assert_eq!(timeout_nanos(Some(Duration::from_nanos(1))), 1);
+    assert_eq!(timeout_nanos(Some(Duration::from_nanos(5000))), 5000);
+    assert_eq!(timeout_nanos(Some(Duration::from_nanos(i64::MAX as u64))), i64::MAX);
+    assert_eq!(timeout_nanos(Some(Duration::from_nanos(i64::MAX as u64 + 1))), i64::MAX);
+    assert_eq!(timeout_nanos(Some(Duration::from_nanos(u64::MAX))), i64::MAX);
+}
+
+impl<T: binder::WriteTo> MessageQueue<T> {
     /// Begin a write transaction. The returned WriteCompletion can be used to
     /// write into the region allocated for the transaction.
     pub fn write(&mut self) -> Option<WriteCompletion<T>> {
@@ -302,6 +315,22 @@ impl<T: Share> MessageQueue<T> {
         // pointers and lengths pointing into the queue. The pointer to txn is
         // not stored.
         unsafe { self.inner.beginWrite(n, addr_of_mut!(txn)) }.then_some(txn)
+    }
+
+    /// Write a slice of items into the `MessageQueue`, blocking until the
+    /// entire slice can be written. If a non-`None` `timeout` is passed, the
+    /// call will time out after this duration.
+    ///
+    /// The return value indicates whether the slice was written into the
+    /// MessageQueue. If false is returned, no elements were written.
+    pub fn write_blocking(&mut self, data: &[T], timeout: Option<Duration>) -> bool {
+        // SAFETY: we pass the mutable slice as raw pointer and length, and the
+        // pointer is known to be valid as it is derived from the slice
+        // directly. For types implementing `Share`, we know that it is OK
+        // to transfer the type over SHM in this manner.
+        unsafe {
+            self.inner.writeBlocking(data.as_ptr() as *const _, data.len(), timeout_nanos(timeout))
+        }
     }
 }
 
@@ -333,7 +362,7 @@ unsafe fn slice_from_raw_parts_or_empty<'a, T>(data: *const T, len: usize) -> &'
 /// a multiple of its alignment, this means this pointer is correctly aligned
 /// for type `T`.
 #[inline(always)]
-fn ptr<T: Share>(txn: &MemTransaction, idx: usize) -> *mut T {
+fn ptr<T>(txn: &MemTransaction, idx: usize) -> *mut T {
     let (base, region_idx) = if idx < txn.first.length {
         (txn.first.address, idx)
     } else {
@@ -366,14 +395,20 @@ these must be forbidden because the underlying AidlMessageQueue only stores the
 number of outstanding reads, not which have and have not completed, so they
 must complete in order. */
 #[must_use]
-pub struct ReadCompletion<'a, T: Share> {
+pub struct ReadCompletion<'a, T: TryFromBytes> {
     inner: MemTransaction,
     queue: &'a mut MessageQueue<T>,
     n_elems: usize,
     n_read: usize,
 }
 
-impl<T: Share> ReadCompletion<'_, T> {
+/// The read instance of a type `T` was not a valid bit pattern. See
+/// `zerocopy::error::ValidityError`, which this is like except that it does
+/// not carry the source value (because it was copied into a temporary buffer).
+#[derive(Eq, PartialEq, Debug)]
+pub struct ValidityError<T>(PhantomData<T>);
+
+impl<'a, T: TryFromBytes + 'a> ReadCompletion<'a, T> {
     /// Obtain a pointer to the location at which the idx'th item is located.
     ///
     /// The returned pointer is correctly aligned for type `T`.
@@ -416,18 +451,50 @@ impl<T: Share> ReadCompletion<'_, T> {
         self.n_elems - self.n_read
     }
 
-    /// Read one item from the `self`. Fails and returns `()` if `self` is empty.
-    pub fn read(&mut self) -> Option<T> {
-        if self.unread_elements() > 0 {
-            // SAFETY: `self.ptr(self.n_read)` returns a pointer aligned for
-            // the type `T` into a shared-memory buffer that will live as long
-            // as the `ErasedMessageQueue` that this `ReadCompletion` borrows.
-            let data = unsafe { self.ptr(self.n_read).read_volatile() };
-            self.n_read += 1;
-            Some(data)
-        } else {
-            None
+    /// Read one item from the `self`.
+    ///
+    /// Returns `None` if `self` is empty. Returns an error if a message was received, but it was
+    /// invalid. (For example, an AIDL union with an illegal tag.)
+    pub fn try_read(&mut self) -> Result<Option<T>, ValidityError<T>> {
+        if self.unread_elements() == 0 {
+            return Ok(None);
         }
+
+        // SAFETY: `self.ptr(self.n_read)` returns a pointer aligned for the
+        // type `T` into a shared-memory buffer that is legal to read with
+        // volatile.
+        let buf = unsafe { (self.ptr(self.n_read).cast::<MaybeUninit<T>>()).read_volatile() };
+
+        self.n_read += 1;
+
+        let ptr = ptr::from_ref(&buf) as *const u8;
+        // SAFETY: Memory read from the shared-memory buffer is initialized.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, size_of::<T>()) };
+
+        let msg = T::try_read_from_bytes(bytes).map_err(|_| ValidityError(PhantomData))?;
+        Ok(Some(msg))
+    }
+
+    /// Read one item from the `self`.
+    ///
+    /// Returns `None` if `self` is empty. Use `try_read` instead if the value does not implement
+    /// `FromBytes`.
+    pub fn read(&mut self) -> Option<T>
+    where
+        T: zerocopy::FromBytes,
+    {
+        if self.unread_elements() == 0 {
+            return None;
+        }
+
+        // SAFETY: `self.ptr(self.n_read)` returns a pointer aligned for the
+        // type `T` into a shared-memory buffer that is legal to read with
+        // volatile.
+        //
+        // It is legal to interpret
+        let res = unsafe { (self.ptr(self.n_read)).read_volatile() };
+        self.n_read += 1;
+        Some(res)
     }
 
     /// Promise to the `ReadCompletion` that `n_newly_read` elements have
@@ -444,7 +511,7 @@ impl<T: Share> ReadCompletion<'_, T> {
     }
 }
 
-impl<T: Share> Drop for ReadCompletion<'_, T> {
+impl<T: TryFromBytes> Drop for ReadCompletion<'_, T> {
     fn drop(&mut self) {
         if self.n_read < self.n_elems {
             error!(
@@ -457,7 +524,7 @@ impl<T: Share> Drop for ReadCompletion<'_, T> {
     }
 }
 
-impl<T: Share> MessageQueue<T> {
+impl<T: TryFromBytes> MessageQueue<T> {
     /// Begin a read transaction. The returned `ReadCompletion` can be used to
     /// write into the region allocated for the transaction.
     pub fn read(&mut self) -> Option<ReadCompletion<T>> {
@@ -483,6 +550,40 @@ impl<T: Share> MessageQueue<T> {
         // pointers and lengths pointing into the queue. The pointer to txn is
         // not stored.
         unsafe { self.inner.beginRead(n, addr_of_mut!(txn)) }.then_some(txn)
+    }
+
+    /// Read a slice of items from the `MessageQueue`, blocking until the entire
+    /// slice can be filled. If a non-`None` `timeout` is passed, the call will
+    /// time out after this duration.
+    ///
+    /// The return value indicates whether the slice was filled with elements
+    /// from the MessageQueue. If false is returned, the slice is not modified.
+    pub fn read_blocking(&mut self, data: &mut [T], timeout: Option<Duration>) -> bool {
+        // SAFETY: we pass the mutable slice as raw pointer and length, and the
+        // pointer is known to be valid as it is derived from the slice
+        // directly. For types implementing `Share`, we know that it is OK to
+        // obtain an instance of the type by copying from SHM in this manner.
+        unsafe {
+            self.inner.readBlocking(data.as_mut_ptr() as *mut _, data.len(), timeout_nanos(timeout))
+        }
+    }
+
+    /// Obtain a reference to the `MessageQueue`'s event flag word if it has one.
+    ///
+    /// Producers and consumers may synchronize over the status of the
+    /// `MessageQueue`'s contents using this atomic, but the specific protocol
+    /// for doing so is not specified and must be coordinated by developers of
+    /// components that intend to use the `MessageQueue` for synchronization.
+    pub fn event_flag_word(&self) -> Option<&AtomicU32> {
+        // SAFETY: the FFI call only depends on the validity of `self`.
+        // Casting a `*mut u32` to `*mut AtomicU32` is valid. The returned
+        // pointer to the EventFlag word is either NULL or a pointer to an
+        // allocation that lasts as long as the underlying FMQ does.
+        unsafe {
+            let event_flag_ptr = self.inner.getEventFlagWord();
+            let atomic_ptr = event_flag_ptr as *mut AtomicU32;
+            NonNull::new(atomic_ptr).map(|nn| nn.as_ref())
+        }
     }
 }
 
